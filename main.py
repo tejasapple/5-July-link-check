@@ -33,7 +33,7 @@ API_HASH  = "18e677db0dc3bb8cf89c574a6f460cc3"
 ADMIN_ID  = 8884734704
 
 # ⚠️ यहाँ अपना स्टोरेज चैनल/ग्रुप ID डालें जहाँ स्क्रैपर लिंक्स भेजेगा
-STORAGE_CHANNEL_ID = -1000000000000  # <--- Change this to your Storage Bot/Channel ID
+STORAGE_CHANNEL_ID = -1004448809511   # <--- Change this to your Storage Bot/Channel ID
 
 # बेसिक चैनल्स
 ACTIVE_CHANNEL_ID  = -1004458234660
