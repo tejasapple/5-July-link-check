@@ -55,7 +55,7 @@ ADD_MEMBER_MEDIA_CHAT_ID = -1004334266609
 SESSIONS_DIR  = "sessions"
 USERS_FILE = "users.txt"
 SCRAPER_STATE_FILE = "scraper_state.json"
-STORAGE_STATE_FILE = "storage_state.json"  # नया: स्टोरेज चेकर की प्रोग्रेस सेव करने के लिए
+STORAGE_STATE_FILE = "storage_state.json"  
 
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
@@ -72,7 +72,6 @@ USER_QUEUES = {}
 QUEUE_CONTROL = {}    
 USER_DELAYS = {}      
 
-# अलग-अलग डुप्लीकेट कैशे (ताकि स्क्रैपर की लिंक चेकर में एरर न दे)
 SCRAPER_DUPLICATES = {}  
 CHECKER_DUPLICATES = {}  
 
@@ -182,33 +181,29 @@ def parse_link(link: str) -> tuple[bool, str]:
     return False, link
 
 async def fast_http_link_check(link: str) -> str:
-    """Strict HTTP Check: Only mark as expired if absolutely sure. Otherwise pass to Pyrogram."""
+    """Super fast check to instantly flag dead links without delaying"""
     link = link.strip().rstrip("-.,_ \n\t*`~")
-    for _ in range(3): # Increased retries
+    for _ in range(1): # Reduced retries for speed
         try:
             async with aiohttp.ClientSession() as s:
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                async with s.get(link, timeout=5, headers=headers) as resp:
+                async with s.get(link, timeout=3, headers=headers) as resp: # Strict fast timeout
                     if resp.status == 200:
                         text = await resp.text()
-                        # Strict checking - ONLY these mean dead link
                         if any(x in text for x in ["Invite link is invalid", "Link is invalid", "has expired"]):
                             return "expired" 
-                            
-                        # If telegram page asks to contact username but no group details, maybe invalid but let Pyrogram verify
                         if "If you have Telegram, you can contact" in text and "@" in text:
                             if "Join Channel" not in text and "Send Message" not in text and "View in Telegram" not in text:
                                 return "unknown"
-                                
                         if any(x in text for x in ["Join Group", "Join Channel", "View in Telegram", "View Channel"]):
                             return "active"
                         return "unknown"
                     elif resp.status == 404:
                         return "unknown" 
                     elif resp.status == 429:
-                        await asyncio.sleep(2) # Wait if ratelimited by HTTP
+                        await asyncio.sleep(0.5)
         except:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
     return "unknown"
 
 async def try_check_link(app: Client, link: str):
@@ -237,7 +232,7 @@ async def try_check_link(app: Client, link: str):
                 try:
                     chat = await app.join_chat(link)
                     joined_now = True
-                    await asyncio.sleep(4) # Increased sleep for Private Links to sync
+                    await asyncio.sleep(2) 
                     try: chat = await app.get_chat(chat.id)
                     except: pass
                 except UserAlreadyParticipant:
@@ -245,7 +240,7 @@ async def try_check_link(app: Client, link: str):
                 except Exception as inner_e:
                     err_msg = str(inner_e).lower()
                     if "invite_request_sent" in err_msg:
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(1)
                         try:
                             chat = await app.get_chat(link)
                             joined_now = True
@@ -283,25 +278,25 @@ async def try_check_link(app: Client, link: str):
                 result["add_member"] = "❌ Off (Channel)"
 
             if joined_now:
-                await asyncio.sleep(3) # Extra wait before searching media
+                await asyncio.sleep(2) 
                 
-            for _ in range(3): # Increased retry for media search
+            for _ in range(2): 
                 try: 
                     result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
                     break
                 except FloodWait as fw:
                     await asyncio.sleep(fw.value + 1)
                 except: 
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
                     
-            for _ in range(3):
+            for _ in range(2):
                 try: 
                     result["photos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO))
                     break
                 except FloodWait as fw:
                     await asyncio.sleep(fw.value + 1)
                 except: 
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
 
         if joined_now and chat:
             await asyncio.sleep(1)
@@ -330,7 +325,6 @@ async def try_check_link(app: Client, link: str):
             result["title"] = "Admin Approval Required"
             return result, False, 0
         else:
-            # If we don't strictly know it's expired, skip it. Don't mark active as expired!
             result["status"] = "skipped"
             result["title"] = f"Error / Skipped"
             return result, True, 0
@@ -485,7 +479,7 @@ async def _run_scraper_task(uid: int, cid: int, state: dict):
                         try:
                             await _send_raw(STORAGE_CHANNEL_ID, text_to_send)
                         except Exception as e: pass
-                        await asyncio.sleep(1.5) 
+                        await asyncio.sleep(1) # Fast delay to avoid limits
                 else:
                     empty_batches += 1
                     
@@ -508,13 +502,13 @@ async def _run_scraper_task(uid: int, cid: int, state: dict):
                     SCRAPER_TASKS[uid] = "stopped"
                     break
                     
-                await asyncio.sleep(5) 
+                await asyncio.sleep(1) # Reduced from 5s to 1s for fast scraping
                 
             except FloodWait as e:
                 await asyncio.sleep(e.value + 5)
             except Exception as e:
                 logger.error(f"Scraper Error: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
 
         await app.disconnect()
 
@@ -641,7 +635,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
     if uid not in USER_QUEUES: USER_QUEUES[uid] = []
     if uid not in CHECKER_DUPLICATES: CHECKER_DUPLICATES[uid] = set()
 
-    # Load starting position for Storage Checker
     storage_last_msg_id = load_storage_state(uid) if auto_storage else 1
     empty_storage_batches = 0
 
@@ -653,22 +646,24 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                 await asyncio.sleep(1)
                 continue
 
-            # Auto Pull Logic From Storage Channel (Paginated forwards like scraper)
+            # Auto Pull Logic From Storage Channel (Fixed Skipping Bug)
             if not USER_QUEUES.get(uid):
                 if not auto_storage: 
                     break 
                 else:
                     fetched_msg = None
+                    messages_received = 0
                     try:
                         c_app = CHECKER_STATE[uid]["clients"][client_keys[0]]["app"]
-                        # Fetch next 10 messages from storage
-                        msg_ids_to_fetch = list(range(storage_last_msg_id, storage_last_msg_id + 10))
+                        # Fetch batch of 50 messages to prevent stopping early on empty gaps
+                        msg_ids_to_fetch = list(range(storage_last_msg_id, storage_last_msg_id + 50))
                         messages = await c_app.get_messages(STORAGE_CHANNEL_ID, msg_ids_to_fetch)
                         
                         links_found_in_batch = False
                         
                         for msg in messages:
                             if not msg or msg.empty: continue
+                            messages_received += 1
                             links = extract_links(msg.text or msg.caption or "")
                             
                             for l in links:
@@ -676,12 +671,10 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                                     USER_QUEUES[uid].append({"link": l, "message_id": msg.id, "chat_id": STORAGE_CHANNEL_ID})
                                     CHECKER_DUPLICATES[uid].add(l)
                                     links_found_in_batch = True
-                            
-                            if links_found_in_batch:
-                                fetched_msg = msg
-                                break # Stop looping, we have links to process
+                                    if not fetched_msg: 
+                                        fetched_msg = msg
                         
-                        storage_last_msg_id += 10
+                        storage_last_msg_id += 50
                         save_storage_state(uid, storage_last_msg_id)
                         
                         if links_found_in_batch:
@@ -697,10 +690,16 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                     
                     if not USER_QUEUES.get(uid):
                         await _update_dashboard_if_needed(uid, force=True)
-                        if empty_storage_batches > 5: # 50 empty messages gap
+                        if empty_storage_batches > 20: # Tolerance of 1000 empty messages gap
                             await _send_raw(cid, "✅ <b>Storage Checking Paused/Finished.</b>\nReached the end of available messages in Storage. Will re-check soon if resumed.")
                             break
-                        await asyncio.sleep(5) 
+                        
+                        if messages_received == 0:
+                            # Reached end of channel, wait for new messages
+                            await asyncio.sleep(5) 
+                        else:
+                            # Messages were fetched but no links found, instantly continue to next chunk
+                            await asyncio.sleep(0.1)
                         continue
 
             item = USER_QUEUES[uid].pop(0)
@@ -764,6 +763,8 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
             asyncio.create_task(dispatch_result(final_result, stats))
             await _update_dashboard_if_needed(uid)
 
+            # 🚀 DELAY LOGIC: Now it purely delays on Active Links. 
+            # Expired and Skipped links will bypass this instantly.
             if final_result["status"] == "active" and not fast_checked_expired:
                 min_del, max_del = USER_DELAYS.get(uid, (10.0, 15.0))
                 delay = random.uniform(min_del, max_del)
@@ -782,7 +783,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
         try: await c_data["app"].disconnect()
         except: pass
 
-    # Clean manual queue if not auto storage to free memory
     if not auto_storage and uid in CHECKER_DUPLICATES:
         CHECKER_DUPLICATES[uid].clear()
 
@@ -1000,7 +1000,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         ctx.user_data["mode"] = "checking_links"
         
-        # मैनुअल चेक के लिए डुप्लीकेट कैशे रिसेट कर दें ताकि स्टोरेज वाले लिंक भी मैनुअल चेक हो सकें
         if uid in CHECKER_DUPLICATES:
             CHECKER_DUPLICATES[uid].clear()
             
@@ -1175,9 +1174,8 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    print("Bot is running perfectly with Smart Features & Storage Pull...")
+    print("Bot is running perfectly with Smart Features & Fast Storage Pull...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
- 
