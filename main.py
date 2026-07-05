@@ -25,7 +25,7 @@ from pyrogram.raw.types import ChatInviteAlready, ChatInvite
 # ─────────────────────────────────────────
 #  CONFIG 
 # ─────────────────────────────────────────
-BOT_TOKEN = "8592502828:AAEJgC0dh-dYMtx8CqO_Qomiz53HRR5HTSs"
+BOT_TOKEN = "8278209344:AAHKR4ejDLyw2ikJs6ATjFgHRLI7Vxl-MKg"
 API_ID    = 32003552
 API_HASH  = "18e677db0dc3bb8cf89c574a6f460cc3"
 
