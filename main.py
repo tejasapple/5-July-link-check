@@ -32,6 +32,9 @@ API_HASH  = "18e677db0dc3bb8cf89c574a6f460cc3"
 
 ADMIN_ID  = 8884734704
 
+# ⚠️ यहाँ अपना स्टोरेज चैनल/ग्रुप ID डालें जहाँ स्क्रैपर लिंक्स भेजेगा
+STORAGE_CHANNEL_ID = -1000000000000  # <--- Change this to your Storage Bot/Channel ID
+
 # बेसिक चैनल्स
 ACTIVE_CHANNEL_ID  = -1004458234660
 EXPIRED_CHANNEL_ID = -1003934489318
@@ -133,10 +136,12 @@ def track_user(uid: int):
     except: pass
 
 def extract_links(text: str) -> list[str]:
+    # Strictly parse t.me links and reject raw @usernames
     raw = re.findall(r"(?:https?://)?t\.me/(?:joinchat/|\+)?[a-zA-Z0-9_\-+]+", text)
     out = []
     seen = set()
     for lnk in raw:
+        # Clean trailing dots, commas, markdown stars, underscores, etc.
         lnk = lnk.rstrip("-.,_ \n\t*`~")
         if not lnk.startswith("http"): lnk = "https://" + lnk
         if lnk not in seen and "t.me/" in lnk:
@@ -162,15 +167,15 @@ async def fast_http_link_check(link: str) -> str:
                     if resp.status == 200:
                         text = await resp.text()
                         if any(x in text for x in ["Invite link is invalid", "Link is invalid", "has expired", "tgme_page_error", "not found"]):
-                            return "expired"
+                            return "unknown" # DOUBLE CHECK: Force Pyrogram to check if HTTP thinks it's expired
                         if "If you have Telegram, you can contact" in text and "@" in text:
                             if "Join Channel" not in text and "Send Message" not in text and "View in Telegram" not in text:
-                                return "expired"
+                                return "unknown" # DOUBLE CHECK
                         if any(x in text for x in ["Join Group", "Join Channel", "View in Telegram", "View Channel"]):
                             return "active"
                         return "unknown"
                     elif resp.status == 404:
-                        return "expired"
+                        return "unknown" # DOUBLE CHECK
         except:
             await asyncio.sleep(0.5)
     return "unknown"
@@ -280,6 +285,7 @@ async def try_check_link(app: Client, link: str):
     except (ChannelBanned, PeerIdInvalid, ChannelPrivate):
         return None, True, 0
     except (InviteHashExpired, InviteHashInvalid, UsernameInvalid, UsernameNotOccupied):
+        # 100% strictly expired confirmed by Pyrogram
         result["status"] = "expired"
         result["title"] = "Expired / Invalid"
         return result, False, 0
@@ -381,7 +387,7 @@ async def dispatch_result(r: dict, stats_tracker: dict):
         await _send_raw(SKIPPED_CHANNEL_ID, f"<b>⚠️ SKIPPED LINK</b>\n━━━━━━━━━━\n{msg}")
 
 # ─────────────────────────────────────────
-#  SCRAPER LOGIC (NEW)
+#  SCRAPER LOGIC (SENDS TO STORAGE)
 # ─────────────────────────────────────────
 async def _run_scraper_task(uid: int, cid: int, state: dict):
     scraper_path = os.path.join(SESSIONS_DIR, f"scraper_{uid}")
@@ -405,9 +411,8 @@ async def _run_scraper_task(uid: int, cid: int, state: dict):
             await _send_raw(cid, f"❌ Failed to get channel: {e}\n(Make sure Scraper ID is inside the channel or it's public)")
             return
             
-        await _send_raw(cid, f"🕷️ <b>Scraper Started!</b>\nTarget: {chat.title}\nStarting from Message ID: <code>{start_msg_id}</code>")
+        await _send_raw(cid, f"🕷️ <b>Scraper Started!</b>\nTarget: {chat.title}\nStarting from Message ID: <code>{start_msg_id}</code>\n<i>Links will be sent directly to your Storage Bot/Channel.</i>")
         
-        # Pinned message for progress
         prog_resp = await _send_raw(cid, f"🔄 <b>Scraper Progress:</b>\nStarting up...")
         prog_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
         
@@ -419,39 +424,40 @@ async def _run_scraper_task(uid: int, cid: int, state: dict):
         current_id = start_msg_id
         batch_size = 50
         empty_batches = 0
+        total_extracted = 0
 
         while SCRAPER_TASKS.get(uid) == "running":
             message_ids = list(range(current_id, current_id + batch_size))
             try:
                 messages = await app.get_messages(chat.id, message_ids)
                 
-                links_found = 0
+                chunk_links = []
+                if uid not in DUPLICATE_CACHE: DUPLICATE_CACHE[uid] = set()
+                
                 for msg in messages:
                     if not msg or msg.empty: continue
                     text = (msg.text or msg.caption or "")
                     links = extract_links(text)
                     
-                    if uid not in USER_QUEUES: USER_QUEUES[uid] = []
-                    if uid not in DUPLICATE_CACHE: DUPLICATE_CACHE[uid] = set()
-                    
                     for l in links:
                         if l not in DUPLICATE_CACHE[uid]:
-                            USER_QUEUES[uid].append({"link": l, "message_id": None})
+                            chunk_links.append(l)
                             DUPLICATE_CACHE[uid].add(l)
-                            links_found += 1
+                            total_extracted += 1
                 
-                if links_found == 0:
-                    empty_batches += 1
-                else:
+                # Send to Storage in proper chunks without any errors
+                if chunk_links:
                     empty_batches = 0
+                    for i in range(0, len(chunk_links), 50): # Send max 50 per message
+                        send_chunk = chunk_links[i:i+50]
+                        text_to_send = "\n".join(send_chunk)
+                        try:
+                            await _send_raw(STORAGE_CHANNEL_ID, text_to_send)
+                        except Exception as e: pass
+                        await asyncio.sleep(1.5) # Slight delay between sends to storage
+                else:
+                    empty_batches += 1
                     
-                # Auto Start Checker if not running
-                if len(USER_QUEUES[uid]) > 0 and not CHECKING_LOCKS.get(uid):
-                    sessions = get_user_sessions(uid)
-                    if sessions:
-                        CHECKING_LOCKS[uid] = True
-                        asyncio.create_task(_run_bulk_check(uid, cid, sessions))
-
                 current_id += batch_size
                 state["start_msg_id"] = current_id
                 save_scraper_state(uid, state)
@@ -461,21 +467,20 @@ async def _run_scraper_task(uid: int, cid: int, state: dict):
                         f"🔄 <b>Scraper Progress:</b>\n"
                         f"🎯 <b>Target:</b> {chat.title}\n"
                         f"📍 <b>Processed up to Msg ID:</b> <code>{current_id}</code>\n"
-                        f"📥 <b>Current Queue Size:</b> {len(USER_QUEUES.get(uid, []))}"
+                        f"📥 <b>Links Extracted:</b> <code>{total_extracted}</code>"
                     )
                     payload = {"chat_id": cid, "message_id": prog_msg_id, "text": status_text, "parse_mode": "HTML"}
                     async with aiohttp.ClientSession() as s: await s.post(f"{TG_API}/editMessageText", json=payload)
                 
                 if empty_batches >= 5: 
-                    # 250 messages consecutive empty -> likely reached the end
                     await _send_raw(cid, "✅ <b>Scraper Finished!</b>\nReached the end of available messages.")
                     SCRAPER_TASKS[uid] = "stopped"
                     break
                     
-                await asyncio.sleep(2) # Anti-Ban Delay for Scraper
+                await asyncio.sleep(5) # Solid Anti-Ban Delay for Scraper to fix lag!
                 
             except FloodWait as e:
-                await asyncio.sleep(e.value)
+                await asyncio.sleep(e.value + 5)
             except Exception as e:
                 logger.error(f"Scraper Error: {e}")
                 await asyncio.sleep(5)
@@ -511,7 +516,7 @@ async def _update_dashboard_if_needed(uid: int, force=False):
         m, s = divmod(eta_seconds, 60)
         h, m = divmod(m, 60)
         eta_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
-    elif queue_left == 0: eta_str = "Done"
+    elif queue_left == 0: eta_str = "Fetching/Done"
     else: eta_str = "Calculating..."
 
     perf_strs = []
@@ -529,7 +534,7 @@ async def _update_dashboard_if_needed(uid: int, force=False):
 
     dash_text = (
         f"<b>⚡ LIVE QUEUE DASHBOARD ⚡</b>\n"
-        f"📊 <b>Processed:</b> <code>{stats['processed']}</code> | <b>In Queue:</b> <code>{queue_left}</code>\n"
+        f"📊 <b>Processed:</b> <code>{stats['processed']}</code> | <b>In Memory Queue:</b> <code>{queue_left}</code>\n"
         f"⏳ <b>Estimated Time Left:</b> <code>{eta_str}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"✅ Active: <code>{stats['active']}</code>\n"
@@ -565,9 +570,9 @@ async def _update_dashboard_if_needed(uid: int, force=False):
     except: pass
 
 # ─────────────────────────────────────────
-#  BULK RUNNER WITH QUEUE
+#  BULK RUNNER WITH QUEUE (AUTO STORAGE PULL ADDED)
 # ─────────────────────────────────────────
-async def _run_bulk_check(uid: int, cid: int, sessions: list):
+async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False):
     QUEUE_CONTROL[uid] = "running"
     
     clients_dict = {}
@@ -599,10 +604,13 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list):
     CHECKER_STATE[uid]["dash_msg_id"] = dash_msg_id
 
     current_pinned_msg_id = None  
+    current_pinned_chat_id = None
     client_keys = list(clients_dict.keys())
     client_idx = 0
 
-    while USER_QUEUES.get(uid):
+    if uid not in USER_QUEUES: USER_QUEUES[uid] = []
+
+    while True:
         try:
             if QUEUE_CONTROL.get(uid) == "stopped": break
             if QUEUE_CONTROL.get(uid) == "paused":
@@ -610,13 +618,60 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list):
                 await asyncio.sleep(1)
                 continue
 
+            # Auto Pull Logic From Storage Channel
+            if not USER_QUEUES.get(uid):
+                if not auto_storage: 
+                    break # Normal manual check ends here
+                else:
+                    # Delete previously completed chunk message
+                    if current_pinned_msg_id and current_pinned_chat_id:
+                        try:
+                            c_app = CHECKER_STATE[uid]["clients"][client_keys[0]]["app"]
+                            await c_app.delete_messages(current_pinned_chat_id, current_pinned_msg_id)
+                        except: pass
+                        current_pinned_msg_id = None
+                        current_pinned_chat_id = None
+
+                    # Fetch a new chunk from Storage
+                    fetched_msg = None
+                    try:
+                        c_app = CHECKER_STATE[uid]["clients"][client_keys[0]]["app"]
+                        # Grabs latest 1 message from Storage Channel
+                        async for msg in c_app.get_chat_history(STORAGE_CHANNEL_ID, limit=1):
+                            fetched_msg = msg
+                    except Exception as e:
+                        pass
+                    
+                    if fetched_msg:
+                        links = extract_links(fetched_msg.text or fetched_msg.caption or "")
+                        if links:
+                            for l in links:
+                                USER_QUEUES[uid].append({"link": l, "message_id": fetched_msg.id, "chat_id": STORAGE_CHANNEL_ID})
+                            current_pinned_msg_id = fetched_msg.id
+                            current_pinned_chat_id = STORAGE_CHANNEL_ID
+                            await _pin_message(STORAGE_CHANNEL_ID, fetched_msg.id)
+                        else:
+                            # If message has no links, delete it and try next time
+                            try: await c_app.delete_messages(STORAGE_CHANNEL_ID, fetched_msg.id)
+                            except: pass
+                            await asyncio.sleep(2)
+                            continue
+                    else:
+                        # Storage is empty, wait for scraper to put new chunks
+                        await _update_dashboard_if_needed(uid, force=True)
+                        await asyncio.sleep(10) 
+                        continue
+
             item = USER_QUEUES[uid].pop(0)
             lnk = item["link"]
-            bunch_msg_id = item["message_id"]
+            msg_id = item.get("message_id")
+            chat_id = item.get("chat_id")
 
-            if bunch_msg_id and bunch_msg_id != current_pinned_msg_id:
-                await _pin_message(cid, bunch_msg_id)
-                current_pinned_msg_id = bunch_msg_id
+            # Pinning mechanism for manual forwarding
+            if not auto_storage and msg_id and msg_id != current_pinned_msg_id:
+                if chat_id: await _pin_message(chat_id, msg_id)
+                else: await _pin_message(cid, msg_id)
+                current_pinned_msg_id = msg_id
 
             fast_checked_expired = False
             http_res = await fast_http_link_check(lnk)
@@ -683,12 +738,19 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list):
             logger.error(f"Error in queue loop: {e}")
             await asyncio.sleep(1) 
 
+    # Clean up last pinned chunk if auto storage is manually stopped
+    if auto_storage and current_pinned_msg_id and current_pinned_chat_id:
+        try:
+            c_app = CHECKER_STATE[uid]["clients"][client_keys[0]]["app"]
+            await c_app.delete_messages(current_pinned_chat_id, current_pinned_msg_id)
+        except: pass
+
     for c_data in CHECKER_STATE[uid]["clients"].values():
         try: await c_data["app"].disconnect()
         except: pass
 
     if uid in DUPLICATE_CACHE and SCRAPER_TASKS.get(uid) != "running":
-        del DUPLICATE_CACHE[uid] # Clear only if Scraper is completely done
+        del DUPLICATE_CACHE[uid] 
 
     stats = CHECKER_STATE[uid]["stats"]
     perf_strs = [f"{v['name']}: {v['checks']}" for v in CHECKER_STATE[uid]["clients"].values()]
@@ -724,7 +786,8 @@ async def _edit_raw(chat_id, message_id, text, keyboard=None):
 def MAIN_KB(uid):
     sessions = get_user_sessions(uid)
     return [
-        [{"text": "🔗 Check Links", "callback_data": "menu_check"}],
+        [{"text": "📥 Auto-Check from Storage", "callback_data": "start_storage_check"}],
+        [{"text": "🔗 Manual Check Links", "callback_data": "menu_check"}],
         [{"text": "🕷️ Scraper Menu", "callback_data": "menu_scraper"}],
         [{"text": f"📱 Manage IDs ({len(sessions)} Active)", "callback_data": "menu_accounts"}],
         [{"text": "⚙️ Settings", "callback_data": "menu_settings"}]
@@ -890,6 +953,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["mode"] = "checking_links"
         await _edit_raw(cid, mid, f"🔗 <b>SEND LINKS NOW</b>\n\nSend up to unlimited links (Forward chunks smoothly).\nBot will process them securely using your {len(sessions)} logged-in IDs with Fallback Support.", [[{"text": "🔙 Back", "callback_data": "back_main"}]])
 
+    elif d == "start_storage_check":
+        sessions = get_user_sessions(uid)
+        if not sessions:
+            await _edit_raw(cid, mid, "❌ <b>No IDs Found!</b>\n\nPlease go to 'Manage IDs' and login at least 1 account.", [[{"text": "🔙 Back", "callback_data": "back_main"}]])
+            return
+        
+        ctx.user_data["mode"] = "storage_checking"
+        if CHECKING_LOCKS.get(uid):
+            await _edit_raw(cid, mid, "⚠️ <b>Queue is already running!</b>", [[{"text": "🔙 Back", "callback_data": "back_main"}]])
+            return
+            
+        CHECKING_LOCKS[uid] = True
+        asyncio.create_task(_run_bulk_check(uid, cid, sessions, auto_storage=True))
+
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message: return
     uid = update.effective_user.id; cid = update.effective_chat.id
@@ -999,7 +1076,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         for l in links:
             if l not in DUPLICATE_CACHE[uid]:
-                USER_QUEUES[uid].append({"link": l, "message_id": bunch_msg_id})
+                USER_QUEUES[uid].append({"link": l, "message_id": bunch_msg_id, "chat_id": cid})
                 DUPLICATE_CACHE[uid].add(l)
                 added_count += 1
             else: duplicate_count += 1
@@ -1022,14 +1099,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         CHECKING_LOCKS[uid] = True
-        asyncio.create_task(_run_bulk_check(uid, cid, sessions))
+        asyncio.create_task(_run_bulk_check(uid, cid, sessions, auto_storage=False))
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    print("Bot is running perfectly with Smart Features...")
+    print("Bot is running perfectly with Smart Features & Storage Pull...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
