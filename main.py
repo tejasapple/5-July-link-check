@@ -33,7 +33,7 @@ API_HASH  = "18e677db0dc3bb8cf89c574a6f460cc3"
 ADMIN_ID  = 8884734704
 
 # ⚠️ यहाँ अपना स्टोरेज चैनल/ग्रुप ID डालें जहाँ स्क्रैपर लिंक्स भेजेगा
-STORAGE_CHANNEL_ID = -1004448809511   # <--- Change this to your Storage Bot/Channel ID
+STORAGE_CHANNEL_ID = -1004448809511   
 
 # बेसिक चैनल्स
 ACTIVE_CHANNEL_ID  = -1004458234660
@@ -55,6 +55,8 @@ ADD_MEMBER_MEDIA_CHAT_ID = -1004334266609
 SESSIONS_DIR  = "sessions"
 USERS_FILE = "users.txt"
 SCRAPER_STATE_FILE = "scraper_state.json"
+STORAGE_STATE_FILE = "storage_state.json"  # नया: स्टोरेज चेकर की प्रोग्रेस सेव करने के लिए
+
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.WARNING)
@@ -69,12 +71,17 @@ CHECKING_LOCKS = {}
 USER_QUEUES = {}      
 QUEUE_CONTROL = {}    
 USER_DELAYS = {}      
-DUPLICATE_CACHE = {}  
+
+# अलग-अलग डुप्लीकेट कैशे (ताकि स्क्रैपर की लिंक चेकर में एरर न दे)
+SCRAPER_DUPLICATES = {}  
+CHECKER_DUPLICATES = {}  
+
 CHECKER_STATE = {}
-
 SCRAPER_TASKS = {}
-PROCESSED_CHUNKS = set() # नया ग्लोबल सेट ताकि हम डिलीट किये बिना ट्रैक कर सकें कि कौनसे चंक्स प्रोसेस हो चुके हैं
 
+# ─────────────────────────────────────────
+#  JSON STATE LOADERS
+# ─────────────────────────────────────────
 def load_scraper_state(uid: int) -> dict:
     try:
         if os.path.exists(SCRAPER_STATE_FILE):
@@ -91,6 +98,24 @@ def save_scraper_state(uid: int, state: dict):
             with open(SCRAPER_STATE_FILE, "r") as f: data = json.load(f)
         data[str(uid)] = state
         with open(SCRAPER_STATE_FILE, "w") as f: json.dump(data, f)
+    except: pass
+
+def load_storage_state(uid: int) -> int:
+    try:
+        if os.path.exists(STORAGE_STATE_FILE):
+            with open(STORAGE_STATE_FILE, "r") as f:
+                data = json.load(f)
+                return data.get(str(uid), 1)
+    except: pass
+    return 1
+
+def save_storage_state(uid: int, msg_id: int):
+    try:
+        data = {}
+        if os.path.exists(STORAGE_STATE_FILE):
+            with open(STORAGE_STATE_FILE, "r") as f: data = json.load(f)
+        data[str(uid)] = msg_id
+        with open(STORAGE_STATE_FILE, "w") as f: json.dump(data, f)
     except: pass
 
 def clean_html_text(text: str) -> str:
@@ -157,24 +182,31 @@ def parse_link(link: str) -> tuple[bool, str]:
     return False, link
 
 async def fast_http_link_check(link: str) -> str:
+    """Strict HTTP Check: Only mark as expired if absolutely sure. Otherwise pass to Pyrogram."""
     link = link.strip().rstrip("-.,_ \n\t*`~")
-    for _ in range(2): 
+    for _ in range(3): # Increased retries
         try:
             async with aiohttp.ClientSession() as s:
-                headers = {"User-Agent": "Mozilla/5.0"}
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
                 async with s.get(link, timeout=5, headers=headers) as resp:
                     if resp.status == 200:
                         text = await resp.text()
-                        if any(x in text for x in ["Invite link is invalid", "Link is invalid", "has expired", "tgme_page_error", "not found"]):
-                            return "unknown" 
+                        # Strict checking - ONLY these mean dead link
+                        if any(x in text for x in ["Invite link is invalid", "Link is invalid", "has expired"]):
+                            return "expired" 
+                            
+                        # If telegram page asks to contact username but no group details, maybe invalid but let Pyrogram verify
                         if "If you have Telegram, you can contact" in text and "@" in text:
                             if "Join Channel" not in text and "Send Message" not in text and "View in Telegram" not in text:
-                                return "unknown" 
+                                return "unknown"
+                                
                         if any(x in text for x in ["Join Group", "Join Channel", "View in Telegram", "View Channel"]):
                             return "active"
                         return "unknown"
                     elif resp.status == 404:
-                        return "unknown"
+                        return "unknown" 
+                    elif resp.status == 429:
+                        await asyncio.sleep(2) # Wait if ratelimited by HTTP
         except:
             await asyncio.sleep(0.5)
     return "unknown"
@@ -205,7 +237,7 @@ async def try_check_link(app: Client, link: str):
                 try:
                     chat = await app.join_chat(link)
                     joined_now = True
-                    await asyncio.sleep(3) 
+                    await asyncio.sleep(4) # Increased sleep for Private Links to sync
                     try: chat = await app.get_chat(chat.id)
                     except: pass
                 except UserAlreadyParticipant:
@@ -251,23 +283,23 @@ async def try_check_link(app: Client, link: str):
                 result["add_member"] = "❌ Off (Channel)"
 
             if joined_now:
-                await asyncio.sleep(2) 
+                await asyncio.sleep(3) # Extra wait before searching media
                 
-            for _ in range(2): 
+            for _ in range(3): # Increased retry for media search
                 try: 
                     result["videos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.VIDEO))
                     break
                 except FloodWait as fw:
-                    await asyncio.sleep(fw.value)
+                    await asyncio.sleep(fw.value + 1)
                 except: 
                     await asyncio.sleep(1)
                     
-            for _ in range(2):
+            for _ in range(3):
                 try: 
                     result["photos"] = str(await app.search_messages_count(chat.id, filter=enums.MessagesFilter.PHOTO))
                     break
                 except FloodWait as fw:
-                    await asyncio.sleep(fw.value)
+                    await asyncio.sleep(fw.value + 1)
                 except: 
                     await asyncio.sleep(1)
 
@@ -298,8 +330,9 @@ async def try_check_link(app: Client, link: str):
             result["title"] = "Admin Approval Required"
             return result, False, 0
         else:
+            # If we don't strictly know it's expired, skip it. Don't mark active as expired!
             result["status"] = "skipped"
-            result["title"] = "Uncheckable / Error"
+            result["title"] = f"Error / Skipped"
             return result, True, 0
 
 # ─────────────────────────────────────────
@@ -424,13 +457,14 @@ async def _run_scraper_task(uid: int, cid: int, state: dict):
         empty_batches = 0
         total_extracted = 0
 
+        if uid not in SCRAPER_DUPLICATES: SCRAPER_DUPLICATES[uid] = set()
+
         while SCRAPER_TASKS.get(uid) == "running":
             message_ids = list(range(current_id, current_id + batch_size))
             try:
                 messages = await app.get_messages(chat.id, message_ids)
                 
                 chunk_links = []
-                if uid not in DUPLICATE_CACHE: DUPLICATE_CACHE[uid] = set()
                 
                 for msg in messages:
                     if not msg or msg.empty: continue
@@ -438,9 +472,9 @@ async def _run_scraper_task(uid: int, cid: int, state: dict):
                     links = extract_links(text)
                     
                     for l in links:
-                        if l not in DUPLICATE_CACHE[uid]:
+                        if l not in SCRAPER_DUPLICATES[uid]:
                             chunk_links.append(l)
-                            DUPLICATE_CACHE[uid].add(l)
+                            SCRAPER_DUPLICATES[uid].add(l)
                             total_extracted += 1
                 
                 if chunk_links:
@@ -469,7 +503,6 @@ async def _run_scraper_task(uid: int, cid: int, state: dict):
                     payload = {"chat_id": cid, "message_id": prog_msg_id, "text": status_text, "parse_mode": "HTML"}
                     async with aiohttp.ClientSession() as s: await s.post(f"{TG_API}/editMessageText", json=payload)
                 
-                # Increased empty batches to 100 (5000 IDs gap) so it doesn't stop at 300 messages randomly
                 if empty_batches >= 100: 
                     await _send_raw(cid, "✅ <b>Scraper Finished!</b>\nReached the end of available messages.")
                     SCRAPER_TASKS[uid] = "stopped"
@@ -602,11 +635,15 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
     CHECKER_STATE[uid]["dash_msg_id"] = dash_msg_id
 
     current_pinned_msg_id = None  
-    current_pinned_chat_id = None
     client_keys = list(clients_dict.keys())
     client_idx = 0
 
     if uid not in USER_QUEUES: USER_QUEUES[uid] = []
+    if uid not in CHECKER_DUPLICATES: CHECKER_DUPLICATES[uid] = set()
+
+    # Load starting position for Storage Checker
+    storage_last_msg_id = load_storage_state(uid) if auto_storage else 1
+    empty_storage_batches = 0
 
     while True:
         try:
@@ -616,45 +653,54 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
                 await asyncio.sleep(1)
                 continue
 
-            # Auto Pull Logic From Storage Channel (Without Deletion)
+            # Auto Pull Logic From Storage Channel (Paginated forwards like scraper)
             if not USER_QUEUES.get(uid):
                 if not auto_storage: 
                     break 
                 else:
-                    current_pinned_msg_id = None
-                    current_pinned_chat_id = None
-
-                    # Fetch a new chunk from Storage without deleting
                     fetched_msg = None
                     try:
                         c_app = CHECKER_STATE[uid]["clients"][client_keys[0]]["app"]
-                        recent_msgs = []
-                        async for msg in c_app.get_chat_history(STORAGE_CHANNEL_ID, limit=100):
-                            recent_msgs.append(msg)
+                        # Fetch next 10 messages from storage
+                        msg_ids_to_fetch = list(range(storage_last_msg_id, storage_last_msg_id + 10))
+                        messages = await c_app.get_messages(STORAGE_CHANNEL_ID, msg_ids_to_fetch)
                         
-                        # Process older pending messages first
-                        for msg in reversed(recent_msgs):
-                            if msg.id not in PROCESSED_CHUNKS:
+                        links_found_in_batch = False
+                        
+                        for msg in messages:
+                            if not msg or msg.empty: continue
+                            links = extract_links(msg.text or msg.caption or "")
+                            
+                            for l in links:
+                                if l not in CHECKER_DUPLICATES[uid]:
+                                    USER_QUEUES[uid].append({"link": l, "message_id": msg.id, "chat_id": STORAGE_CHANNEL_ID})
+                                    CHECKER_DUPLICATES[uid].add(l)
+                                    links_found_in_batch = True
+                            
+                            if links_found_in_batch:
                                 fetched_msg = msg
-                                break
+                                break # Stop looping, we have links to process
+                        
+                        storage_last_msg_id += 10
+                        save_storage_state(uid, storage_last_msg_id)
+                        
+                        if links_found_in_batch:
+                            empty_storage_batches = 0
+                            if fetched_msg:
+                                current_pinned_msg_id = fetched_msg.id
+                                await _pin_message(STORAGE_CHANNEL_ID, fetched_msg.id)
+                        else:
+                            empty_storage_batches += 1
+                            
                     except Exception as e:
                         pass
                     
-                    if fetched_msg:
-                        PROCESSED_CHUNKS.add(fetched_msg.id)
-                        links = extract_links(fetched_msg.text or fetched_msg.caption or "")
-                        if links:
-                            for l in links:
-                                USER_QUEUES[uid].append({"link": l, "message_id": fetched_msg.id, "chat_id": STORAGE_CHANNEL_ID})
-                            current_pinned_msg_id = fetched_msg.id
-                            current_pinned_chat_id = STORAGE_CHANNEL_ID
-                            await _pin_message(STORAGE_CHANNEL_ID, fetched_msg.id)
-                        else:
-                            await asyncio.sleep(2)
-                            continue
-                    else:
+                    if not USER_QUEUES.get(uid):
                         await _update_dashboard_if_needed(uid, force=True)
-                        await asyncio.sleep(10) 
+                        if empty_storage_batches > 5: # 50 empty messages gap
+                            await _send_raw(cid, "✅ <b>Storage Checking Paused/Finished.</b>\nReached the end of available messages in Storage. Will re-check soon if resumed.")
+                            break
+                        await asyncio.sleep(5) 
                         continue
 
             item = USER_QUEUES[uid].pop(0)
@@ -736,8 +782,9 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list, auto_storage=False
         try: await c_data["app"].disconnect()
         except: pass
 
-    if uid in DUPLICATE_CACHE and SCRAPER_TASKS.get(uid) != "running":
-        del DUPLICATE_CACHE[uid] 
+    # Clean manual queue if not auto storage to free memory
+    if not auto_storage and uid in CHECKER_DUPLICATES:
+        CHECKER_DUPLICATES[uid].clear()
 
     stats = CHECKER_STATE[uid]["stats"]
     perf_strs = [f"{v['name']}: {v['checks']}" for v in CHECKER_STATE[uid]["clients"].values()]
@@ -773,7 +820,7 @@ async def _edit_raw(chat_id, message_id, text, keyboard=None):
 def MAIN_KB(uid):
     sessions = get_user_sessions(uid)
     return [
-        [{"text": "📥 Auto-Check from Storage", "callback_data": "start_storage_check"}],
+        [{"text": "📥 Auto-Check Storage", "callback_data": "menu_storage"}],
         [{"text": "🔗 Manual Check Links", "callback_data": "menu_check"}],
         [{"text": "🕷️ Scraper Menu", "callback_data": "menu_scraper"}],
         [{"text": f"📱 Manage IDs ({len(sessions)} Active)", "callback_data": "menu_accounts"}],
@@ -889,8 +936,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         state = load_scraper_state(uid)
         state["start_msg_id"] = 1
-        if uid in DUPLICATE_CACHE:
-            DUPLICATE_CACHE[uid].clear()
+        if uid in SCRAPER_DUPLICATES:
+            SCRAPER_DUPLICATES[uid].clear()
         save_scraper_state(uid, state)
         
         await _edit_raw(cid, mid, "🔄 <b>Scraper Reset Successfully!</b>\n\nAll duplicate cache cleared. Scraper will now start completely fresh from Message ID 1.", [[{"text": "🔙 Scraper Menu", "callback_data": "menu_scraper"}]])
@@ -952,7 +999,28 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _edit_raw(cid, mid, "❌ <b>No IDs Found!</b>\n\nPlease go to 'Manage IDs' and login at least 1 account before checking links.", [[{"text": "🔙 Back", "callback_data": "back_main"}]])
             return
         ctx.user_data["mode"] = "checking_links"
+        
+        # मैनुअल चेक के लिए डुप्लीकेट कैशे रिसेट कर दें ताकि स्टोरेज वाले लिंक भी मैनुअल चेक हो सकें
+        if uid in CHECKER_DUPLICATES:
+            CHECKER_DUPLICATES[uid].clear()
+            
         await _edit_raw(cid, mid, f"🔗 <b>SEND LINKS NOW</b>\n\nSend up to unlimited links (Forward chunks smoothly).\nBot will process them securely using your {len(sessions)} logged-in IDs with Fallback Support.", [[{"text": "🔙 Back", "callback_data": "back_main"}]])
+
+    elif d == "menu_storage":
+        current_id = load_storage_state(uid)
+        kb = [
+            [{"text": "▶️ Start Auto-Check", "callback_data": "start_storage_check"}],
+            [{"text": "🔄 Reset Storage Progress", "callback_data": "reset_storage_check"}],
+            [{"text": "🔙 Back", "callback_data": "back_main"}]
+        ]
+        await _edit_raw(cid, mid, f"📥 <b>Storage Auto-Check Menu</b>\n\n📌 <b>Current Position:</b> Message ID <code>{current_id}</code>\n\n<i>Start checking links automatically from your Storage Channel.</i>", kb)
+
+    elif d == "reset_storage_check":
+        save_storage_state(uid, 1)
+        if uid in CHECKER_DUPLICATES:
+            CHECKER_DUPLICATES[uid].clear()
+        kb = [[{"text": "🔙 Back to Storage Menu", "callback_data": "menu_storage"}]]
+        await _edit_raw(cid, mid, "✅ <b>Storage Progress Reset!</b>\n\nThe bot will now start checking from the very first message in the Storage Channel. Duplicate cache is also cleared.", kb)
 
     elif d == "start_storage_check":
         sessions = get_user_sessions(uid)
@@ -1070,15 +1138,15 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         if uid not in USER_QUEUES: USER_QUEUES[uid] = []
-        if uid not in DUPLICATE_CACHE: DUPLICATE_CACHE[uid] = set()
+        if uid not in CHECKER_DUPLICATES: CHECKER_DUPLICATES[uid] = set()
             
         bunch_msg_id = update.message.message_id
         added_count = duplicate_count = 0
 
         for l in links:
-            if l not in DUPLICATE_CACHE[uid]:
+            if l not in CHECKER_DUPLICATES[uid]:
                 USER_QUEUES[uid].append({"link": l, "message_id": bunch_msg_id, "chat_id": cid})
-                DUPLICATE_CACHE[uid].add(l)
+                CHECKER_DUPLICATES[uid].add(l)
                 added_count += 1
             else: duplicate_count += 1
 
@@ -1112,3 +1180,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
