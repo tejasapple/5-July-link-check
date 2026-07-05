@@ -5,6 +5,7 @@ import re
 import time
 import html
 import random
+import json
 import aiohttp
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -45,11 +46,12 @@ MEMBERS_2500_5000_ID = -1004320671631
 MEMBERS_5000_PLUS_ID = -1004320042078
 
 # 2. ऐड मेंबर + चैटिंग/मीडिया चैनल्स
-ADD_MEMBER_TEXT_CHAT_ID = -1004334266609    # चैटिंग (Text) ऑन + ऐड मेंबर ऑन
-ADD_MEMBER_MEDIA_CHAT_ID = -1004334266609  # सिर्फ मीडिया ऑन (Text ऑफ) + ऐड मेंबर ऑन
+ADD_MEMBER_TEXT_CHAT_ID = -1004334266609    
+ADD_MEMBER_MEDIA_CHAT_ID = -1004334266609  
 
 SESSIONS_DIR  = "sessions"
 USERS_FILE = "users.txt"
+SCRAPER_STATE_FILE = "scraper_state.json"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.WARNING)
@@ -65,25 +67,47 @@ USER_QUEUES = {}
 QUEUE_CONTROL = {}    
 USER_DELAYS = {}      
 DUPLICATE_CACHE = {}  
-
 CHECKER_STATE = {}
+
+SCRAPER_TASKS = {}
+
+def load_scraper_state(uid: int) -> dict:
+    try:
+        if os.path.exists(SCRAPER_STATE_FILE):
+            with open(SCRAPER_STATE_FILE, "r") as f:
+                data = json.load(f)
+                return data.get(str(uid), {"channel": None, "start_msg_id": 1, "progress_msg_id": None})
+    except: pass
+    return {"channel": None, "start_msg_id": 1, "progress_msg_id": None}
+
+def save_scraper_state(uid: int, state: dict):
+    try:
+        data = {}
+        if os.path.exists(SCRAPER_STATE_FILE):
+            with open(SCRAPER_STATE_FILE, "r") as f: data = json.load(f)
+        data[str(uid)] = state
+        with open(SCRAPER_STATE_FILE, "w") as f: json.dump(data, f)
+    except: pass
 
 def clean_html_text(text: str) -> str:
     if not text: return "Unknown"
     return html.escape(str(text))
 
-def get_user_sessions(uid: int) -> list:
+def get_user_sessions(uid: int, include_scraper=False) -> list:
     sessions = []
     prefix = f"u{uid}_"
     try:
         for file in os.listdir(SESSIONS_DIR):
             if file.startswith(prefix) and file.endswith(".session"):
-                base_name = file.replace(".session", "")
-                path = os.path.join(SESSIONS_DIR, base_name)
-                if path not in sessions:
-                    sessions.append(path)
+                sessions.append(os.path.join(SESSIONS_DIR, file.replace(".session", "")))
     except: pass
-    return sorted(sessions, key=lambda x: int(x.split('_')[-1]) if '_' in x else 0)
+    sessions = sorted(sessions, key=lambda x: int(x.split('_')[-1]) if '_' in x else 0)
+    
+    if include_scraper:
+        scraper_path = os.path.join(SESSIONS_DIR, f"scraper_{uid}")
+        if os.path.exists(scraper_path + ".session"):
+            sessions.append(scraper_path)
+    return sessions
 
 def get_next_slot(uid: int) -> int:
     sessions = get_user_sessions(uid)
@@ -166,7 +190,6 @@ async def try_check_link(app: Client, link: str):
     try:
         if not is_private:
             chat = await app.get_chat(ref)
-            # Expired Username False Positives Fix
             if getattr(chat, 'type', None) not in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP, enums.ChatType.CHANNEL]:
                 raise UsernameInvalid("Not a group or channel")
         else:
@@ -205,7 +228,6 @@ async def try_check_link(app: Client, link: str):
             has_protected = getattr(chat, 'has_protected_content', False)
             result["forward"] = "❌ Off" if has_protected else "✅ On"
             
-            # Permissions Check (Text vs Media & Add Member)
             if getattr(chat, 'type', None) in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
                 if chat.permissions:
                     can_txt = chat.permissions.can_send_messages
@@ -224,7 +246,6 @@ async def try_check_link(app: Client, link: str):
                 result["chatting"] = "❌ Off (Channel)"
                 result["add_member"] = "❌ Off (Channel)"
 
-            # Private Channel Media Count Fix
             if joined_now:
                 await asyncio.sleep(2) 
                 
@@ -332,8 +353,6 @@ async def dispatch_result(r: dict, stats_tracker: dict):
         if is_chat_on:
             stats_tracker["chat"] += 1
             await _send_raw(CHATTING_ON_CHANNEL_ID, f"<b>💬 CHATTING ON LINK</b>\n━━━━━━━━━━\n{msg}")
-            
-            # Member Based Routing (Only if Chat is ON)
             try:
                 m_count = int(r.get("members", 0)) if r.get("members") != "N/A" else 0
                 if m_count < 1000:
@@ -360,6 +379,115 @@ async def dispatch_result(r: dict, stats_tracker: dict):
         await _send_raw(EXPIRED_CHANNEL_ID, f"<b>❌ EXPIRED LINK</b>\n━━━━━━━━━━\n{msg}")
     elif r["status"] == "skipped":
         await _send_raw(SKIPPED_CHANNEL_ID, f"<b>⚠️ SKIPPED LINK</b>\n━━━━━━━━━━\n{msg}")
+
+# ─────────────────────────────────────────
+#  SCRAPER LOGIC (NEW)
+# ─────────────────────────────────────────
+async def _run_scraper_task(uid: int, cid: int, state: dict):
+    scraper_path = os.path.join(SESSIONS_DIR, f"scraper_{uid}")
+    if not os.path.exists(scraper_path + ".session"):
+        await _send_raw(cid, "❌ Scraper ID is not logged in!")
+        return
+
+    channel = state.get("channel")
+    start_msg_id = state.get("start_msg_id", 1)
+    
+    if not channel:
+        await _send_raw(cid, "❌ Please set the Target Channel first.")
+        return
+
+    app = Client(scraper_path, api_id=API_ID, api_hash=API_HASH, no_updates=True)
+    try:
+        await app.connect()
+        try: chat = await app.get_chat(channel)
+        except Exception as e:
+            await app.disconnect()
+            await _send_raw(cid, f"❌ Failed to get channel: {e}\n(Make sure Scraper ID is inside the channel or it's public)")
+            return
+            
+        await _send_raw(cid, f"🕷️ <b>Scraper Started!</b>\nTarget: {chat.title}\nStarting from Message ID: <code>{start_msg_id}</code>")
+        
+        # Pinned message for progress
+        prog_resp = await _send_raw(cid, f"🔄 <b>Scraper Progress:</b>\nStarting up...")
+        prog_msg_id = prog_resp.get("result", {}).get("message_id") if isinstance(prog_resp, dict) else None
+        
+        if prog_msg_id:
+            await _pin_message(cid, prog_msg_id)
+            state["progress_msg_id"] = prog_msg_id
+            save_scraper_state(uid, state)
+
+        current_id = start_msg_id
+        batch_size = 50
+        empty_batches = 0
+
+        while SCRAPER_TASKS.get(uid) == "running":
+            message_ids = list(range(current_id, current_id + batch_size))
+            try:
+                messages = await app.get_messages(chat.id, message_ids)
+                
+                links_found = 0
+                for msg in messages:
+                    if not msg or msg.empty: continue
+                    text = (msg.text or msg.caption or "")
+                    links = extract_links(text)
+                    
+                    if uid not in USER_QUEUES: USER_QUEUES[uid] = []
+                    if uid not in DUPLICATE_CACHE: DUPLICATE_CACHE[uid] = set()
+                    
+                    for l in links:
+                        if l not in DUPLICATE_CACHE[uid]:
+                            USER_QUEUES[uid].append({"link": l, "message_id": None})
+                            DUPLICATE_CACHE[uid].add(l)
+                            links_found += 1
+                
+                if links_found == 0:
+                    empty_batches += 1
+                else:
+                    empty_batches = 0
+                    
+                # Auto Start Checker if not running
+                if len(USER_QUEUES[uid]) > 0 and not CHECKING_LOCKS.get(uid):
+                    sessions = get_user_sessions(uid)
+                    if sessions:
+                        CHECKING_LOCKS[uid] = True
+                        asyncio.create_task(_run_bulk_check(uid, cid, sessions))
+
+                current_id += batch_size
+                state["start_msg_id"] = current_id
+                save_scraper_state(uid, state)
+
+                if prog_msg_id:
+                    status_text = (
+                        f"🔄 <b>Scraper Progress:</b>\n"
+                        f"🎯 <b>Target:</b> {chat.title}\n"
+                        f"📍 <b>Processed up to Msg ID:</b> <code>{current_id}</code>\n"
+                        f"📥 <b>Current Queue Size:</b> {len(USER_QUEUES.get(uid, []))}"
+                    )
+                    payload = {"chat_id": cid, "message_id": prog_msg_id, "text": status_text, "parse_mode": "HTML"}
+                    async with aiohttp.ClientSession() as s: await s.post(f"{TG_API}/editMessageText", json=payload)
+                
+                if empty_batches >= 5: 
+                    # 250 messages consecutive empty -> likely reached the end
+                    await _send_raw(cid, "✅ <b>Scraper Finished!</b>\nReached the end of available messages.")
+                    SCRAPER_TASKS[uid] = "stopped"
+                    break
+                    
+                await asyncio.sleep(2) # Anti-Ban Delay for Scraper
+                
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                logger.error(f"Scraper Error: {e}")
+                await asyncio.sleep(5)
+
+        await app.disconnect()
+
+    except Exception as e:
+        await _send_raw(cid, f"❌ Scraper crashed: {e}")
+        try: await app.disconnect()
+        except: pass
+    
+    SCRAPER_TASKS[uid] = "stopped"
 
 # ─────────────────────────────────────────
 #  NON-BLOCKING DASHBOARD UPDATER
@@ -471,7 +599,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list):
     CHECKER_STATE[uid]["dash_msg_id"] = dash_msg_id
 
     current_pinned_msg_id = None  
-    
     client_keys = list(clients_dict.keys())
     client_idx = 0
 
@@ -503,8 +630,8 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list):
                 fast_checked_expired = True
             else:
                 current_time = time.time()
-                
                 selected_key = None
+                
                 for _ in range(len(client_keys)):
                     k = client_keys[client_idx % len(client_keys)]
                     client_idx += 1
@@ -520,7 +647,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list):
                     continue
 
                 c_data = CHECKER_STATE[uid]["clients"][selected_key]
-                
                 res, retry_needed, fw_time = await try_check_link(c_data["app"], lnk)
                 
                 if fw_time > 0:
@@ -541,7 +667,6 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list):
             
             CHECKER_STATE[uid]["last_result"] = final_result
             asyncio.create_task(dispatch_result(final_result, stats))
-            
             await _update_dashboard_if_needed(uid)
 
             if final_result["status"] == "active" and not fast_checked_expired:
@@ -562,7 +687,8 @@ async def _run_bulk_check(uid: int, cid: int, sessions: list):
         try: await c_data["app"].disconnect()
         except: pass
 
-    if uid in DUPLICATE_CACHE: del DUPLICATE_CACHE[uid]
+    if uid in DUPLICATE_CACHE and SCRAPER_TASKS.get(uid) != "running":
+        del DUPLICATE_CACHE[uid] # Clear only if Scraper is completely done
 
     stats = CHECKER_STATE[uid]["stats"]
     perf_strs = [f"{v['name']}: {v['checks']}" for v in CHECKER_STATE[uid]["clients"].values()]
@@ -599,6 +725,7 @@ def MAIN_KB(uid):
     sessions = get_user_sessions(uid)
     return [
         [{"text": "🔗 Check Links", "callback_data": "menu_check"}],
+        [{"text": "🕷️ Scraper Menu", "callback_data": "menu_scraper"}],
         [{"text": f"📱 Manage IDs ({len(sessions)} Active)", "callback_data": "menu_accounts"}],
         [{"text": "⚙️ Settings", "callback_data": "menu_settings"}]
     ]
@@ -636,6 +763,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif d == "queue_stop":
         QUEUE_CONTROL[uid] = "stopped"
+        SCRAPER_TASKS[uid] = "stopped"
 
     elif d == "back_main":
         await cleanup_login_state(uid)
@@ -651,18 +779,70 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["mode"] = "setting_delay"
         await _edit_raw(cid, mid, "⏱️ <b>Send your custom delay in seconds.</b>\n\nExample: `5 10` (for a random delay between 5 to 10 seconds)", [[{"text": "🔙 Cancel", "callback_data": "menu_settings"}]])
 
+    elif d == "menu_scraper":
+        state = load_scraper_state(uid)
+        scraper_path = os.path.join(SESSIONS_DIR, f"scraper_{uid}.session")
+        is_logged_in = "✅ Logged In" if os.path.exists(scraper_path) else "❌ Not Logged In"
+        
+        kb = [
+            [{"text": "➕ Login Scraper ID" if not os.path.exists(scraper_path) else "🗑 Logout Scraper ID", "callback_data": "scraper_login_tog"}],
+            [{"text": "🎯 Set Target Channel", "callback_data": "scraper_set_target"}],
+            [{"text": "📍 Set Start Link (Msg ID)", "callback_data": "scraper_set_start"}],
+            [{"text": "▶️ Start Scraping", "callback_data": "scraper_start"}, {"text": "🛑 Stop", "callback_data": "scraper_stop"}],
+            [{"text": "🔙 Back", "callback_data": "back_main"}]
+        ]
+        
+        text = (f"🕷️ <b>Scraper Management</b>\n\n"
+                f"👤 <b>Status:</b> {is_logged_in}\n"
+                f"🎯 <b>Target Channel:</b> <code>{state['channel'] or 'None'}</code>\n"
+                f"📍 <b>Start Message ID:</b> <code>{state['start_msg_id']}</code>\n\n"
+                f"<i>(Set channel and start point, then click Start. It will extract links safely and send to queue automatically.)</i>")
+        await _edit_raw(cid, mid, text, kb)
+
+    elif d == "scraper_login_tog":
+        scraper_path = os.path.join(SESSIONS_DIR, f"scraper_{uid}.session")
+        if os.path.exists(scraper_path):
+            os.remove(scraper_path)
+            await _edit_raw(cid, mid, "✅ Scraper ID Logged Out.", [[{"text": "🔙 Scraper Menu", "callback_data": "menu_scraper"}]])
+        else:
+            ctx.user_data["mode"] = "login_phone"
+            ctx.user_data["login_type"] = "scraper"
+            await _edit_raw(cid, mid, "📱 Send your Telegram Phone Number with country code for **SCRAPER ID**.\nExample: <code>+919876543210</code>", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
+
+    elif d == "scraper_set_target":
+        ctx.user_data["mode"] = "scraper_target"
+        await _edit_raw(cid, mid, "🎯 <b>Send Target Channel Username or ID</b>\n\nExample: `-10012345678` or `@mychannel`", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
+
+    elif d == "scraper_set_start":
+        ctx.user_data["mode"] = "scraper_start_link"
+        await _edit_raw(cid, mid, "📍 <b>Send Specific Message Link</b>\n\nExample: `https://t.me/c/12345/600`\n<i>(Bot will start scraping from Message ID 600)</i>", [[{"text": "🔙 Cancel", "callback_data": "menu_scraper"}]])
+
+    elif d == "scraper_start":
+        if SCRAPER_TASKS.get(uid) == "running":
+            await _edit_raw(cid, mid, "⚠️ Scraper is already running!", [[{"text": "🔙 Scraper Menu", "callback_data": "menu_scraper"}]])
+            return
+        
+        state = load_scraper_state(uid)
+        SCRAPER_TASKS[uid] = "running"
+        asyncio.create_task(_run_scraper_task(uid, cid, state))
+        await _edit_raw(cid, mid, "✅ Scraper background task started! Progress will be pinned shortly.", [[{"text": "🔙 Scraper Menu", "callback_data": "menu_scraper"}]])
+
+    elif d == "scraper_stop":
+        SCRAPER_TASKS[uid] = "stopped"
+        await _edit_raw(cid, mid, "🛑 Scraper stopped.", [[{"text": "🔙 Scraper Menu", "callback_data": "menu_scraper"}]])
+
     elif d == "menu_accounts":
         sessions = get_user_sessions(uid)
-        kb = [[{"text": "➕ Login New ID", "callback_data": "login_new"}], [{"text": "🩺 Check Accounts Status", "callback_data": "check_health"}]]
+        kb = [[{"text": "➕ Login New Checker ID", "callback_data": "login_new"}], [{"text": "🩺 Check Accounts Status", "callback_data": "check_health"}]]
         for s in sessions:
             base_name = os.path.basename(s)
             kb.append([{"text": f"🗑 Logout ID: {base_name}", "callback_data": f"logout_{base_name}"}])
         if len(sessions) > 1: kb.append([{"text": "🗑 Logout All IDs", "callback_data": "logout_all"}])
         kb.append([{"text": "🔙 Back", "callback_data": "back_main"}])
-        await _edit_raw(cid, mid, f"📱 <b>Account Manager</b>\n\nLogged in IDs: <b>{len(sessions)}</b>\n\nYou can logout specific IDs, add new ones, or check their health.", kb)
+        await _edit_raw(cid, mid, f"📱 <b>Checker Account Manager</b>\n\nLogged in IDs: <b>{len(sessions)}</b>\n\nYou can logout specific IDs, add new ones, or check their health.", kb)
 
     elif d == "check_health":
-        await _edit_raw(cid, mid, "⏳ <b>Checking health of all logged-in IDs...</b>\n\n<i>This might take a moment.</i>")
+        await _edit_raw(cid, mid, "⏳ <b>Checking health of all logged-in Checker IDs...</b>\n\n<i>This might take a moment.</i>")
         sessions = get_user_sessions(uid)
         working_count = dead_count = 0
         for s in sessions:
@@ -698,6 +878,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif d == "login_new":
         ctx.user_data["mode"] = "login_phone"
+        ctx.user_data["login_type"] = "checker"
         ctx.user_data["slot"] = get_next_slot(uid)
         await _edit_raw(cid, mid, "📱 Send your Telegram Phone Number with country code.\nExample: <code>+919876543210</code>", [[{"text": "🔙 Cancel", "callback_data": "menu_accounts"}]])
 
@@ -717,7 +898,29 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if text == "/start": return 
 
-    if mode == "setting_delay":
+    if mode == "scraper_target":
+        state = load_scraper_state(uid)
+        try:
+            val = int(text)
+            state["channel"] = val
+        except:
+            state["channel"] = text
+        save_scraper_state(uid, state)
+        ctx.user_data["mode"] = ""
+        await update.message.reply_text(f"✅ Target Channel set to: <code>{state['channel']}</code>", parse_mode="HTML")
+
+    elif mode == "scraper_start_link":
+        m = re.search(r"/(\d+)$", text)
+        if m:
+            state = load_scraper_state(uid)
+            state["start_msg_id"] = int(m.group(1))
+            save_scraper_state(uid, state)
+            ctx.user_data["mode"] = ""
+            await update.message.reply_text(f"✅ Start Message ID set to: <code>{state['start_msg_id']}</code>", parse_mode="HTML")
+        else:
+            await update.message.reply_text("❌ Invalid link format. Make sure it ends with a message ID (e.g. `.../600`)", parse_mode="Markdown")
+
+    elif mode == "setting_delay":
         try:
             parts = text.split()
             if len(parts) == 2:
@@ -736,8 +939,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         msg = await update.message.reply_text("⏳ Sending OTP...")
         try:
-            slot = ctx.user_data["slot"]
-            app = Client(os.path.join(SESSIONS_DIR, f"u{uid}_{slot}"), api_id=API_ID, api_hash=API_HASH)
+            ltype = ctx.user_data.get("login_type", "checker")
+            if ltype == "scraper":
+                s_name = f"scraper_{uid}"
+            else:
+                s_name = f"u{uid}_{ctx.user_data['slot']}"
+                
+            app = Client(os.path.join(SESSIONS_DIR, s_name), api_id=API_ID, api_hash=API_HASH)
             await app.connect()
             sent = await app.send_code(text)
             LOGIN_STATE[uid] = {"app": app, "phone": text, "hash": sent.phone_code_hash}
